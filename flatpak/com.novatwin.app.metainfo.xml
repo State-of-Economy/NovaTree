@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>com.novatwin.app</id>
+  <name>NovaTwin</name>
+  <summary>Desktop Chat Client for Google Gemini</summary>
+  <metadata_license>MIT</metadata_license>
+  <project_license>MIT</project_license>
+  <description>
+    <p>
+      NovaTwin is a lightweight desktop chat client for the Google Gemini API,
+      built with Tauri.
+    </p>
+  </description>
+  <launchable type="desktop-id">com.novatwin.app.desktop</launchable>
+  <url type="homepage">https://github.com/State-of-Economy/NovaTwin</url>
+  <content_rating type="oars-1.1"/>
+  <releases>
+    <release version="0.3.1" date="2026-07-29"/>
+  </releases>
+</component>

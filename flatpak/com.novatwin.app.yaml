@@ -1,0 +1,66 @@
+id: com.novatwin.app
+runtime: org.gnome.Platform
+runtime-version: '50'
+sdk: org.gnome.Sdk
+command: novatwin
+rename-icon: com.novatwin.app
+
+sdk-extensions:
+  - org.freedesktop.Sdk.Extension.node24
+  - org.freedesktop.Sdk.Extension.rust-stable
+
+finish-args:
+  - --socket=fallback-x11
+  - --socket=wayland
+  - --share=ipc
+  - --device=dri
+  - --share=network
+
+  # tauri-plugin-dialog uses the FileChooser portal (no extra permission needed),
+  # but Tauri's asset protocol still needs read access to the workspace folders
+  # the user picks, so grant broad home access.
+  - --filesystem=home
+
+  # keyring crate (sync-secret-service) talks to the Secret Service over D-Bus.
+  - --talk-name=org.freedesktop.secrets
+  - --filesystem=xdg-run/keyring
+
+build-options:
+  append-path: /usr/lib/sdk/node24/bin:/usr/lib/sdk/rust-stable/bin
+
+modules:
+  - name: novatwin
+    buildsystem: simple
+    build-options:
+      env:
+        CARGO_HOME: /run/build/novatwin/cargo
+        XDG_CACHE_HOME: /run/build/novatwin/flatpak-node/cache
+        npm_config_cache: /run/build/novatwin/flatpak-node/npm-cache
+        npm_config_offline: 'true'
+    build-commands:
+      - npm ci --offline
+      - cargo --offline fetch --manifest-path src-tauri/Cargo.toml
+      - npm run tauri build -- --no-bundle -v
+      - install -Dm755 -t /app/bin/ src-tauri/target/release/novatwin
+      - install -Dm644 -t /app/share/applications/ flatpak/com.novatwin.app.desktop
+      - install -Dm644 -t /app/share/metainfo/ flatpak/com.novatwin.app.metainfo.xml
+      - install -Dm644 flatpak/com.novatwin.app.png /app/share/icons/hicolor/512x512/apps/com.novatwin.app.png
+    sources:
+      - type: dir
+        path: ..
+        skip:
+          - .git
+          - node_modules
+          - src-tauri/target
+          - flatpak
+      - cargo-sources.json
+      - node-sources.json
+      - type: file
+        path: com.novatwin.app.desktop
+        dest: flatpak
+      - type: file
+        path: com.novatwin.app.metainfo.xml
+        dest: flatpak
+      - type: file
+        path: com.novatwin.app.png
+        dest: flatpak
