@@ -1,5 +1,7 @@
 import { open } from "@tauri-apps/plugin-dialog";
+import { openUrl } from "@tauri-apps/plugin-opener";
 import { invoke } from "@tauri-apps/api/core";
+import { startClipboardPolling, stopClipboardPolling } from "./clipboard";
 import {
   loadSettings,
   saveSettings,
@@ -9,27 +11,60 @@ import {
   saveQuota,
   loadApiKey,
   saveApiKey,
+  loadLastSeenVersion,
+  saveLastSeenVersion,
+  loadWorkspaceDisclaimerAccepted,
+  saveWorkspaceDisclaimerAccepted,
 } from "./storage";
-import { GeminiApiError, historyToContents, sendToGemini, stripCodeFences } from "./gemini";
-import { checkForUpdates } from "./updater";
-import { initTitlebar } from "./titlebar";
 import {
+  GeminiApiError,
+  WORKSPACE_RESPONSE_SCHEMA,
+  historyToContents,
+  sendToGeminiWithRetry,
+  stripCodeFences,
+} from "./gemini";
+import { checkForUpdates } from "./updater";
+import { initTitlebar, getAppVersion } from "./titlebar";
+import {
+  applyWorkspaceEdits,
+  createWorkspaceProject,
   deleteWorkspaceFile,
   listWorkspaceFiles,
+  parseWorkspaceResponse,
   pickWorkspaceFolder,
-  tryParseWorkspaceCommand,
+  readWorkspaceFile,
   writeWorkspaceFile,
 } from "./workspace";
+import { t, setLanguage, getLanguage } from "./i18n";
+import { PATCH_NOTES } from "./patchnotes";
+import {
+  initEditor,
+  openAbsoluteFileInEditor,
+  openWorkspaceFileInEditor,
+  removeTabIfOpen,
+  setAllWorkspaceTabsLocked,
+  setTabAILock,
+  setWorkspacePath as setEditorWorkspacePath,
+  updateTabContent,
+} from "./editor";
+import { requestApproval, requestBatchCreateApproval } from "./approval";
 import {
   AppSettings,
   AttachedFile,
   Chat,
+  ChatImage,
   ChatMessage,
   DAILY_REQUEST_LIMIT,
   DEFAULT_MODEL,
+  DEFAULT_SECURITY_SETTINGS,
+  Language,
   MODEL_OPTIONS,
   PER_MINUTE_REQUEST_LIMIT,
   QuotaState,
+  SecurityMode,
+  WorkspaceActionResult,
+  actionRequiresApproval,
+  buildLanguageSystemPromptAddition,
   buildWorkspaceSystemPromptAddition,
 } from "./types";
 
@@ -40,10 +75,15 @@ let settings: AppSettings;
 let apiKey: string | null = null;
 let quota: QuotaState = { date: "", count: 0 };
 let pendingAttachments: AttachedFile[] = [];
+let pendingImages: ChatImage[] = [];
 const requestTimestamps: number[] = [];
 let cooldownTimer: ReturnType<typeof setInterval> | null = null;
 let cooldownUntil = 0;
 let workspaceFilesExpanded = false;
+let pendingTimerInterval: ReturnType<typeof setInterval> | null = null;
+let pendingStatusNote = "";
+let appVersion = "";
+let workspaceDisclaimerAccepted = false;
 
 // ---- DOM ----
 const chatListEl = document.getElementById("chat-list")!;
@@ -67,9 +107,28 @@ const settingsModalEl = document.getElementById("settings-modal")!;
 const settingsBtnEl = document.getElementById("settings-btn")!;
 const settingsCloseEl = document.getElementById("settings-close")!;
 const settingsSaveEl = document.getElementById("settings-save")!;
+const langDeBtnEl = document.getElementById("lang-de")!;
+const langEnBtnEl = document.getElementById("lang-en")!;
+const titlebarVersionEl = document.getElementById("titlebar-version")!;
+const patchnotesModalEl = document.getElementById("patchnotes-modal")!;
+const patchnotesCloseEl = document.getElementById("patchnotes-close")!;
+const patchnotesBodyEl = document.getElementById("patchnotes-body")!;
 const apiKeyInputEl = document.getElementById("api-key-input") as HTMLInputElement;
 const systemPromptInputEl = document.getElementById("system-prompt-input") as HTMLTextAreaElement;
 const safetySelectEl = document.getElementById("safety-select") as HTMLSelectElement;
+const securityModeSelectEl = document.getElementById("security-mode-select") as HTMLSelectElement;
+const approvalCreateEl = document.getElementById("approval-create") as HTMLInputElement;
+const approvalEditEl = document.getElementById("approval-edit") as HTMLInputElement;
+const approvalDeleteEl = document.getElementById("approval-delete") as HTMLInputElement;
+const getApiKeyBtnEl = document.getElementById("get-api-key-btn")!;
+const apiKeyDetectedNoteEl = document.getElementById("api-key-detected-note")!;
+const disclaimerModalEl = document.getElementById("disclaimer-modal")!;
+const disclaimerTitleEl = document.getElementById("disclaimer-title")!;
+const disclaimerTextEl = document.getElementById("disclaimer-text")!;
+const disclaimerCheckboxEl = document.getElementById("disclaimer-checkbox") as HTMLInputElement;
+const disclaimerCheckboxLabelEl = document.getElementById("disclaimer-checkbox-label")!;
+const disclaimerCancelEl = document.getElementById("disclaimer-cancel")!;
+const disclaimerAcceptEl = document.getElementById("disclaimer-accept") as HTMLButtonElement;
 
 function todayStr(): string {
   return new Date().toISOString().slice(0, 10);
@@ -118,13 +177,51 @@ function persist() {
   saveChats(chats);
 }
 
+function startChatRename(chat: Chat, titleEl: HTMLElement) {
+  const input = document.createElement("input");
+  input.type = "text";
+  input.className = "chat-title-input";
+  input.value = chat.title;
+  titleEl.replaceWith(input);
+  input.focus();
+  input.select();
+
+  let settled = false;
+  const commit = () => {
+    if (settled) return;
+    settled = true;
+    const newTitle = input.value.trim();
+    chat.title = newTitle || chat.title;
+    persist();
+    renderChatList();
+  };
+  const cancel = () => {
+    if (settled) return;
+    settled = true;
+    renderChatList();
+  };
+
+  input.addEventListener("keydown", (e) => {
+    e.stopPropagation();
+    if (e.key === "Enter") commit();
+    else if (e.key === "Escape") cancel();
+  });
+  input.addEventListener("blur", commit);
+  input.addEventListener("click", (e) => e.stopPropagation());
+}
+
 function renderChatList() {
   chatListEl.innerHTML = "";
   for (const chat of [...chats].sort((a, b) => b.createdAt - a.createdAt)) {
     const item = document.createElement("div");
     item.className = "chat-list-item" + (chat.id === activeChatId ? " active" : "");
-    item.innerHTML = `<span class="chat-title">${escapeHtml(chat.title)}</span><button class="delete-chat" title="Löschen">✕</button>`;
-    item.querySelector(".chat-title")!.addEventListener("click", () => selectChat(chat.id));
+    item.innerHTML = `<span class="chat-title">${escapeHtml(chat.title)}</span><button class="delete-chat" title="${t.deleteChatTitle}">✕</button>`;
+    const titleEl = item.querySelector(".chat-title") as HTMLElement;
+    titleEl.addEventListener("click", () => selectChat(chat.id));
+    item.addEventListener("contextmenu", (e) => {
+      e.preventDefault();
+      showChatContextMenu(e.clientX, e.clientY, chat, titleEl);
+    });
     item.querySelector(".delete-chat")!.addEventListener("click", (e) => {
       e.stopPropagation();
       deleteChat(chat.id);
@@ -133,7 +230,63 @@ function renderChatList() {
   }
 }
 
+let chatContextMenuEl: HTMLElement | null = null;
+
+function hideChatContextMenu() {
+  chatContextMenuEl?.remove();
+  chatContextMenuEl = null;
+  document.removeEventListener("click", hideChatContextMenu);
+}
+
+function showChatContextMenu(x: number, y: number, chat: Chat, titleEl: HTMLElement) {
+  hideChatContextMenu();
+  const menu = document.createElement("div");
+  menu.className = "context-menu";
+  menu.style.left = `${x}px`;
+  menu.style.top = `${y}px`;
+  menu.innerHTML = `
+    <button class="context-menu-item" data-action="rename">✏️ ${t.renameChatTitle}</button>
+    <button class="context-menu-item danger" data-action="delete">🗑️ ${t.deleteChatTitle}</button>
+  `;
+  menu.querySelector('[data-action="rename"]')!.addEventListener("click", () => {
+    hideChatContextMenu();
+    startChatRename(chat, titleEl);
+  });
+  menu.querySelector('[data-action="delete"]')!.addEventListener("click", () => {
+    hideChatContextMenu();
+    deleteChat(chat.id);
+  });
+  document.body.appendChild(menu);
+  chatContextMenuEl = menu;
+  setTimeout(() => document.addEventListener("click", hideChatContextMenu), 0);
+}
+
+function stopPendingTimer() {
+  if (pendingTimerInterval) {
+    clearInterval(pendingTimerInterval);
+    pendingTimerInterval = null;
+  }
+}
+
+function startPendingTimer(startedAt: number) {
+  stopPendingTimer();
+  const el = document.getElementById("pending-timer-text");
+  if (!el) return;
+  const tick = () => {
+    const timerEl = document.getElementById("pending-timer-text");
+    if (!timerEl) {
+      stopPendingTimer();
+      return;
+    }
+    const elapsed = Math.max(0, Math.floor((Date.now() - startedAt) / 1000));
+    timerEl.textContent = `${pendingStatusNote || t.thinking}… ${elapsed}s`;
+  };
+  tick();
+  pendingTimerInterval = setInterval(tick, 1000);
+}
+
 function renderMessages() {
+  stopPendingTimer();
   const chat = activeChat();
   messagesEl.innerHTML = "";
   if (!chat) return;
@@ -142,33 +295,58 @@ function renderMessages() {
     const el = document.createElement("div");
     el.className = `message ${msg.role}` + (msg.pending ? " pending" : "") + (msg.error ? " error" : "");
 
-    const roleLabel = msg.role === "user" ? "Du" : "NovaTwin";
+    const roleLabel = msg.role === "user" ? t.you : "NovaTree";
     let filesHtml = "";
     if (msg.files && msg.files.length) {
       filesHtml = `<div class="file-actions">${msg.files
-        .map((f) => `<span class="file-tag">📎 ${escapeHtml(f.name)}</span>`)
+        .map((f, i) => `<span class="file-tag" data-file-idx="${i}" title="${t.openInEditorTitle}">📎 ${escapeHtml(f.name)}</span>`)
+        .join("")}</div>`;
+    }
+    if (msg.images && msg.images.length) {
+      filesHtml += `<div class="message-images">${msg.images
+        .map((img) => `<img src="${img.dataUrl}" alt="${escapeHtml(img.name)}" class="message-image-thumb" />`)
         .join("")}</div>`;
     }
 
-    const bubbleHtml = msg.workspaceAction
-      ? ""
-      : `<div class="bubble">${renderMessageBody(msg.text || (msg.pending ? "…" : ""))}</div>`;
+    let bubbleHtml: string;
+    if (msg.pending) {
+      bubbleHtml =
+        '<div class="bubble"><span class="typing-dots"><span></span><span></span><span></span></span>' +
+        '<span id="pending-timer-text" class="pending-timer"></span></div>';
+    } else if (msg.workspaceActions && !msg.text) {
+      bubbleHtml = "";
+    } else {
+      bubbleHtml = `<div class="bubble">${renderMessageBody(msg.text)}</div>`;
+    }
 
     let workspaceActionHtml = "";
-    if (msg.workspaceAction) {
-      const wa = msg.workspaceAction;
-      const actionLabel = { create: "erstellt", edit: "bearbeitet", delete: "gelöscht" }[wa.action];
-      workspaceActionHtml = wa.success
-        ? `<div class="workspace-action-note success">Datei ${actionLabel}: ${escapeHtml(wa.filename)}</div>`
-        : `<div class="workspace-action-note failed">Aktion „${wa.action}" für ${escapeHtml(wa.filename)} fehlgeschlagen: ${escapeHtml(wa.error ?? "")}</div>`;
+    if (msg.workspaceActions) {
+      const actionLabel = { create: t.fileCreated, edit: t.fileEdited, delete: t.fileDeleted, create_project: "" };
+      workspaceActionHtml = msg.workspaceActions
+        .map((wa) => {
+          if (wa.success && wa.action === "create_project") {
+            return `<div class="workspace-action-note success">${escapeHtml(wa.filename)}</div>`;
+          }
+          return wa.success
+            ? `<div class="workspace-action-note success">${escapeHtml(actionLabel[wa.action])}: ${escapeHtml(wa.filename)}</div>`
+            : `<div class="workspace-action-note failed">${escapeHtml(t.actionFailed(wa.action, wa.filename, wa.error ?? ""))}</div>`;
+        })
+        .join("");
     }
 
     el.innerHTML = `
-      <span class="role-label">${roleLabel}</span>
+      <span class="role-label">${escapeHtml(roleLabel)}</span>
       ${bubbleHtml}
       ${workspaceActionHtml}
       ${filesHtml}
     `;
+
+    if (msg.files && msg.files.length) {
+      el.querySelectorAll<HTMLElement>(".file-tag[data-file-idx]").forEach((tagEl) => {
+        const file = msg.files![Number(tagEl.dataset.fileIdx)];
+        if (file) tagEl.addEventListener("click", () => openAbsoluteFileInEditor(file.path, file.name, file.content));
+      });
+    }
 
     // Offer "Datei aktualisieren" for model responses that follow a user message with attachments
     if (msg.role === "model" && !msg.pending && !msg.error) {
@@ -179,15 +357,15 @@ function renderMessages() {
         for (const file of prevUser.files) {
           const btn = document.createElement("button");
           btn.className = "update-file-btn";
-          btn.textContent = `Datei aktualisieren: ${file.name}`;
+          btn.textContent = t.updateFileBtn(file.name);
           btn.addEventListener("click", async () => {
             try {
               const newContent = stripCodeFences(msg.text);
               await invoke("write_text_file", { path: file.path, content: newContent });
-              btn.textContent = `Aktualisiert: ${file.name}`;
+              btn.textContent = t.updatedFileBtn(file.name);
               btn.classList.add("done");
             } catch (err) {
-              alert(`Fehler beim Schreiben der Datei: ${err}`);
+              alert(t.updateFileError(String(err)));
             }
           });
           actions.appendChild(btn);
@@ -197,6 +375,10 @@ function renderMessages() {
     }
 
     messagesEl.appendChild(el);
+
+    if (msg.pending && msg.pendingStartedAt) {
+      startPendingTimer(msg.pendingStartedAt);
+    }
   });
 
   messagesEl.scrollTop = messagesEl.scrollHeight;
@@ -204,7 +386,7 @@ function renderMessages() {
 
 function updateHeader() {
   const chat = activeChat();
-  tokenUsageEl.textContent = `Tokens: ${chat?.totalTokens ?? 0}`;
+  tokenUsageEl.textContent = t.tokens(chat?.totalTokens ?? 0);
 
   // Ältere Chats können noch ein inzwischen entferntes/deaktiviertes Modell (z. B. "gemini-2.5-flash")
   // referenzieren; auf das aktuelle Standardmodell migrieren, statt eine leere Auswahl anzuzeigen.
@@ -215,7 +397,7 @@ function updateHeader() {
   modelSelectEl.value = chat?.model ?? DEFAULT_MODEL;
 
   const nearLimit = quota.count >= DAILY_REQUEST_LIMIT * 0.9;
-  quotaUsageEl.textContent = `Anfragen heute: ${quota.count} / ${DAILY_REQUEST_LIMIT}`;
+  quotaUsageEl.textContent = t.requestsToday(quota.count, DAILY_REQUEST_LIMIT);
   quotaUsageEl.classList.toggle("warn", nearLimit);
 }
 
@@ -224,24 +406,86 @@ function renderAttachments() {
   pendingAttachments.forEach((file, idx) => {
     const badge = document.createElement("div");
     badge.className = "attachment-badge";
-    badge.innerHTML = `<span>📎 ${escapeHtml(file.name)}</span><button title="Entfernen">✕</button>`;
-    badge.querySelector("button")!.addEventListener("click", () => {
+    badge.innerHTML = `<span class="attachment-name" title="${t.openInEditorTitle}">📎 ${escapeHtml(file.name)}</span><button title="${t.removeAttachmentTitle}">✕</button>`;
+    badge.querySelector(".attachment-name")!.addEventListener("click", () => {
+      openAbsoluteFileInEditor(file.path, file.name, file.content);
+    });
+    badge.querySelector("button")!.addEventListener("click", (e) => {
+      e.stopPropagation();
       pendingAttachments.splice(idx, 1);
+      renderAttachments();
+    });
+    attachmentsEl.appendChild(badge);
+  });
+  pendingImages.forEach((img, idx) => {
+    const badge = document.createElement("div");
+    badge.className = "attachment-badge image-badge";
+    badge.innerHTML = `<img src="${img.dataUrl}" alt="${escapeHtml(img.name)}" class="attachment-thumb" /><button title="${t.removeImageTitle}">✕</button>`;
+    badge.querySelector("button")!.addEventListener("click", (e) => {
+      e.stopPropagation();
+      pendingImages.splice(idx, 1);
       renderAttachments();
     });
     attachmentsEl.appendChild(badge);
   });
 }
 
+const MAX_IMAGE_WIDTH = 1024;
+const IMAGE_JPEG_QUALITY = 0.7;
+
+/** Downscales/compresses a pasted or dropped image client-side (max 1024px wide, JPEG q=0.7)
+ * before it's ever sent to Gemini, so large screenshots don't blow up the request payload. */
+function downscaleImage(file: File): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onerror = () => reject(reader.error);
+    reader.onload = () => {
+      const img = new Image();
+      img.onerror = () => reject(new Error("Bild konnte nicht geladen werden."));
+      img.onload = () => {
+        const scale = Math.min(1, MAX_IMAGE_WIDTH / img.width);
+        const canvas = document.createElement("canvas");
+        canvas.width = Math.max(1, Math.round(img.width * scale));
+        canvas.height = Math.max(1, Math.round(img.height * scale));
+        const ctx = canvas.getContext("2d");
+        if (!ctx) {
+          reject(new Error("Canvas-Kontext nicht verfügbar."));
+          return;
+        }
+        ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+        resolve(canvas.toDataURL("image/jpeg", IMAGE_JPEG_QUALITY));
+      };
+      img.src = reader.result as string;
+    };
+    reader.readAsDataURL(file);
+  });
+}
+
+async function addPendingImageFile(file: File) {
+  if (!file.type.startsWith("image/")) return;
+  try {
+    const dataUrl = await downscaleImage(file);
+    pendingImages.push({ dataUrl, name: file.name || "image.jpg" });
+    renderAttachments();
+  } catch (err) {
+    console.debug("Bild konnte nicht verarbeitet werden:", err);
+  }
+}
+
 function renderWorkspaceBar() {
   const chat = activeChat();
   const path = chat?.workspacePath;
-  workspacePathEl.textContent = path ?? "Kein Arbeitsordner verknüpft";
+  workspacePathEl.textContent = path ?? t.noWorkspace;
   workspacePathEl.classList.toggle("linked", !!path);
   workspacePathEl.title = path ?? "";
   workspaceToggleBtnEl.classList.toggle("hidden", !path);
   workspaceDetachBtnEl.classList.toggle("hidden", !path);
+  workspaceToggleBtnEl.title = workspaceFilesExpanded ? t.hideFilesTitle : t.showFilesTitle;
   workspaceToggleBtnEl.textContent = workspaceFilesExpanded ? "▴" : "▾";
+  workspaceDetachBtnEl.title = t.detachWorkspaceTitle;
+  workspacePickBtnEl.title = t.pickWorkspaceTitle;
+
+  setEditorWorkspacePath(path ?? null);
 
   if (!path) {
     workspaceFilesEl.classList.add("hidden");
@@ -252,20 +496,65 @@ function renderWorkspaceBar() {
 async function renderWorkspaceFiles() {
   const chat = activeChat();
   if (!chat?.workspacePath) return;
-  workspaceFilesEl.innerHTML = "Lade Dateien…";
+  workspaceFilesEl.textContent = t.loadingFiles;
   try {
     const files = await listWorkspaceFiles(chat.workspacePath);
     workspaceFilesEl.innerHTML = files.length
-      ? files.map((f) => `<div class="workspace-file-entry">${escapeHtml(f)}</div>`).join("")
-      : "<div class=\"workspace-file-entry\">(Ordner ist leer)</div>";
+      ? files.map((f) => `<div class="workspace-file-entry" data-path="${escapeHtml(f)}">${escapeHtml(f)}</div>`).join("")
+      : `<div class="workspace-file-entry">${escapeHtml(t.emptyFolder)}</div>`;
+    workspaceFilesEl.querySelectorAll<HTMLElement>(".workspace-file-entry[data-path]").forEach((el) => {
+      el.addEventListener("click", () => openWorkspaceFileInEditor(el.dataset.path!));
+    });
   } catch (err) {
-    workspaceFilesEl.textContent = `Fehler beim Lesen des Ordners: ${err}`;
+    workspaceFilesEl.textContent = `${t.folderReadError}: ${err}`;
   }
+}
+
+/** Shows the one-time "autonomous file access" disclaimer before a workspace folder is linked or
+ * the security mode is loosened, gating the accept button on the checkbox being ticked. Resolves
+ * immediately with true if the disclaimer was already accepted in a previous session. */
+function ensureWorkspaceDisclaimerAccepted(): Promise<boolean> {
+  if (workspaceDisclaimerAccepted) return Promise.resolve(true);
+
+  disclaimerTitleEl.textContent = t.disclaimerTitle;
+  disclaimerTextEl.textContent = t.disclaimerText;
+  disclaimerCheckboxLabelEl.textContent = t.disclaimerCheckboxLabel;
+  disclaimerCancelEl.textContent = t.disclaimerCancel;
+  disclaimerAcceptEl.textContent = t.disclaimerAccept;
+  disclaimerCheckboxEl.checked = false;
+  disclaimerAcceptEl.disabled = true;
+  disclaimerModalEl.classList.remove("hidden");
+
+  return new Promise((resolve) => {
+    const onCheckboxChange = () => {
+      disclaimerAcceptEl.disabled = !disclaimerCheckboxEl.checked;
+    };
+    const cleanup = () => {
+      disclaimerModalEl.classList.add("hidden");
+      disclaimerCheckboxEl.removeEventListener("change", onCheckboxChange);
+      disclaimerAcceptEl.removeEventListener("click", onAccept);
+      disclaimerCancelEl.removeEventListener("click", onCancel);
+    };
+    const onAccept = async () => {
+      cleanup();
+      workspaceDisclaimerAccepted = true;
+      await saveWorkspaceDisclaimerAccepted();
+      resolve(true);
+    };
+    const onCancel = () => {
+      cleanup();
+      resolve(false);
+    };
+    disclaimerCheckboxEl.addEventListener("change", onCheckboxChange);
+    disclaimerAcceptEl.addEventListener("click", onAccept);
+    disclaimerCancelEl.addEventListener("click", onCancel);
+  });
 }
 
 async function pickWorkspace() {
   const chat = activeChat();
   if (!chat) return;
+  if (!(await ensureWorkspaceDisclaimerAccepted())) return;
   const folder = await pickWorkspaceFolder();
   if (!folder) return;
   chat.workspacePath = folder;
@@ -316,7 +605,7 @@ function deleteChat(id: string) {
 function createNewChat() {
   const chat: Chat = {
     id: crypto.randomUUID(),
-    title: "Neuer Chat",
+    title: t.newChat,
     model: modelSelectEl.value || DEFAULT_MODEL,
     messages: [],
     createdAt: Date.now(),
@@ -332,7 +621,7 @@ function createNewChat() {
 }
 
 async function attachFiles() {
-  const selected = await open({ multiple: true, title: "Datei anhängen" });
+  const selected = await open({ multiple: true, title: t.attachFileDialogTitle });
   if (!selected) return;
   const paths = Array.isArray(selected) ? selected : [selected];
   for (const path of paths) {
@@ -343,7 +632,7 @@ async function attachFiles() {
       );
       pendingAttachments.push(result);
     } catch (err) {
-      alert(`Datei konnte nicht gelesen werden: ${err}`);
+      alert(t.readFileError(String(err)));
     }
   }
   renderAttachments();
@@ -369,7 +658,7 @@ function startCooldown(seconds: number) {
       return;
     }
     sendBtnEl.textContent = `${remaining}s`;
-    cooldownNoticeEl.textContent = `Kontingent-Limit erreicht. Bitte warte ${remaining}s, bevor du erneut sendest.`;
+    cooldownNoticeEl.textContent = t.cooldownNotice(remaining);
   };
 
   if (cooldownTimer) clearInterval(cooldownTimer);
@@ -387,7 +676,7 @@ function withinRateLimit(): boolean {
 
 async function sendMessage() {
   const text = promptInputEl.value.trim();
-  if (!text && pendingAttachments.length === 0) return;
+  if (!text && pendingAttachments.length === 0 && pendingImages.length === 0) return;
 
   if (isInCooldown()) {
     // Server-seitiges Kontingent-Limit aktiv: keine automatischen oder manuellen Wiederholungsversuche zulassen.
@@ -395,18 +684,18 @@ async function sendMessage() {
   }
 
   if (!apiKey) {
-    alert("Bitte zuerst einen Google AI Studio API-Schlüssel in den Einstellungen hinterlegen.");
+    alert(t.needApiKey);
     openSettings();
     return;
   }
 
   if (quota.date === todayStr() && quota.count >= DAILY_REQUEST_LIMIT) {
-    alert("Tageslimit von 1000 Anfragen erreicht. Bitte morgen erneut versuchen.");
+    alert(t.dailyLimitReached);
     return;
   }
 
   if (!withinRateLimit()) {
-    alert("Rate-Limit erreicht: maximal 15 Anfragen pro Minute. Bitte kurz warten.");
+    alert(t.rateLimitReached);
     return;
   }
 
@@ -417,17 +706,20 @@ async function sendMessage() {
     role: "user",
     text,
     files: pendingAttachments.length ? [...pendingAttachments] : undefined,
+    images: pendingImages.length ? [...pendingImages] : undefined,
   };
   chat.messages.push(userMessage);
 
-  if (chat.title === "Neuer Chat" && text) {
+  if (chat.title === t.newChat && text) {
     chat.title = text.slice(0, 40);
   }
 
-  const pendingMessage: ChatMessage = { role: "model", text: "", pending: true };
+  const pendingMessage: ChatMessage = { role: "model", text: "", pending: true, pendingStartedAt: Date.now() };
   chat.messages.push(pendingMessage);
+  pendingStatusNote = "";
 
   pendingAttachments = [];
+  pendingImages = [];
   promptInputEl.value = "";
   autoGrowTextarea();
   renderAttachments();
@@ -436,8 +728,10 @@ async function sendMessage() {
 
   requestTimestamps.push(Date.now());
 
+  if (chat.workspacePath) setAllWorkspaceTabsLocked(true);
+
   try {
-    let systemPrompt = settings.systemPrompt;
+    let systemPrompt = settings.systemPrompt + buildLanguageSystemPromptAddition(settings.language);
     if (chat.workspacePath) {
       try {
         const files = await listWorkspaceFiles(chat.workspacePath);
@@ -448,31 +742,118 @@ async function sendMessage() {
     }
 
     const contents = historyToContents(chat.messages.slice(0, -1));
-    const result = await sendToGemini(apiKey, chat.model, systemPrompt, settings.safetyThreshold, contents);
-
-    const workspaceCommand = chat.workspacePath ? tryParseWorkspaceCommand(result.text) : null;
-
-    if (workspaceCommand && chat.workspacePath) {
-      try {
-        if (workspaceCommand.action === "delete") {
-          await deleteWorkspaceFile(chat.workspacePath, workspaceCommand.filename);
-        } else {
-          await writeWorkspaceFile(chat.workspacePath, workspaceCommand.filename, workspaceCommand.content ?? "");
-        }
-        pendingMessage.workspaceAction = {
-          action: workspaceCommand.action,
-          filename: workspaceCommand.filename,
-          success: true,
-        };
-      } catch (err) {
-        pendingMessage.workspaceAction = {
-          action: workspaceCommand.action,
-          filename: workspaceCommand.filename,
-          success: false,
-          error: err instanceof Error ? err.message : String(err),
-        };
+    const fallbackModels = MODEL_OPTIONS.filter((o) => !o.disabled && o.value !== chat.model).map((o) => o.value);
+    const result = await sendToGeminiWithRetry(
+      apiKey,
+      chat.model,
+      systemPrompt,
+      settings.safetyThreshold,
+      contents,
+      chat.workspacePath ? WORKSPACE_RESPONSE_SCHEMA : undefined,
+      fallbackModels,
+      (status) => {
+        pendingStatusNote = status.isFallback
+          ? t.modelOverloadedSwitching(status.model)
+          : status.attempt > 1
+            ? t.modelOverloadedRetrying(status.attempt, status.maxAttempts)
+            : "";
       }
-      if (workspaceFilesExpanded) await renderWorkspaceFiles();
+    );
+    pendingStatusNote = "";
+
+    if (chat.workspacePath) {
+      const workspacePath = chat.workspacePath;
+      const { reply, actions, createProject } = parseWorkspaceResponse(result.text);
+      pendingMessage.text = reply;
+
+      const results: WorkspaceActionResult[] = [];
+
+      if (actions.length) {
+        for (const cmd of actions) {
+          if (actionRequiresApproval(cmd.action, settings.security)) {
+            const approved = await requestApproval(cmd, workspacePath);
+            if (!approved) {
+              results.push({
+                action: cmd.action,
+                filename: cmd.filename,
+                success: false,
+                error: t.actionRejectedByUser,
+              });
+              continue;
+            }
+          }
+          setTabAILock(cmd.filename, true);
+          try {
+            if (cmd.action === "delete") {
+              await deleteWorkspaceFile(workspacePath, cmd.filename);
+              removeTabIfOpen(cmd.filename);
+            } else if (cmd.action === "edit" && cmd.edits && cmd.edits.length) {
+              const outcomes = await applyWorkspaceEdits(workspacePath, cmd.filename, cmd.edits);
+              const problem = outcomes.find((o) => o.status !== "SUCCESS_PRECISE");
+              if (problem) {
+                results.push({
+                  action: cmd.action,
+                  filename: cmd.filename,
+                  success: false,
+                  error: problem.status === "FUZZY_MATCH_NEEDED" ? t.editFuzzyMatch : t.editNotFound,
+                });
+                continue;
+              }
+              const newContent = await readWorkspaceFile(workspacePath, cmd.filename);
+              updateTabContent(cmd.filename, newContent);
+            } else {
+              await writeWorkspaceFile(workspacePath, cmd.filename, cmd.content ?? "");
+              updateTabContent(cmd.filename, cmd.content ?? "");
+            }
+            results.push({ action: cmd.action, filename: cmd.filename, success: true });
+          } catch (err) {
+            results.push({
+              action: cmd.action,
+              filename: cmd.filename,
+              success: false,
+              error: err instanceof Error ? err.message : String(err),
+            });
+          } finally {
+            setTabAILock(cmd.filename, false);
+          }
+        }
+      }
+
+      if (createProject && createProject.files.length) {
+        let approved = true;
+        if (actionRequiresApproval("create", settings.security)) {
+          approved = await requestBatchCreateApproval(createProject.rootFolder, createProject.files);
+        }
+        if (!approved) {
+          results.push({
+            action: "create_project",
+            filename: createProject.rootFolder,
+            success: false,
+            error: t.actionRejectedByUser,
+          });
+        } else {
+          try {
+            await createWorkspaceProject(workspacePath, createProject.rootFolder, createProject.files);
+            results.push({
+              action: "create_project",
+              filename: t.fileCreatedProject(createProject.rootFolder, createProject.files.length),
+              success: true,
+            });
+          } catch (err) {
+            results.push({
+              action: "create_project",
+              filename: createProject.rootFolder,
+              success: false,
+              error: err instanceof Error ? err.message : String(err),
+            });
+          }
+        }
+      }
+
+      if (results.length) {
+        pendingMessage.workspaceActions = results;
+        if (workspaceFilesExpanded) await renderWorkspaceFiles();
+      }
     } else {
       pendingMessage.text = result.text;
     }
@@ -492,11 +873,13 @@ async function sendMessage() {
   } catch (err) {
     pendingMessage.pending = false;
     pendingMessage.error = true;
-    pendingMessage.text = `Fehler: ${err instanceof Error ? err.message : err}`;
+    pendingMessage.text = t.errorPrefix(String(err instanceof Error ? err.message : err));
 
     if (err instanceof GeminiApiError && err.status === 429) {
       startCooldown(err.retryAfterSeconds ?? 40);
     }
+  } finally {
+    if (chat.workspacePath) setAllWorkspaceTabsLocked(false);
   }
 
   persist();
@@ -510,15 +893,56 @@ function autoGrowTextarea() {
 }
 
 // ---- Settings modal ----
+function updateSecurityCheckboxesDisabled() {
+  const mode = securityModeSelectEl.value as SecurityMode;
+  const editable = mode === "partial";
+  approvalCreateEl.disabled = !editable;
+  approvalEditEl.disabled = !editable;
+  approvalDeleteEl.disabled = !editable;
+  if (mode === "always") {
+    approvalCreateEl.checked = true;
+    approvalEditEl.checked = true;
+    approvalDeleteEl.checked = true;
+  } else if (mode === "none") {
+    approvalCreateEl.checked = false;
+    approvalEditEl.checked = false;
+    approvalDeleteEl.checked = false;
+  }
+}
+
 function openSettings() {
   apiKeyInputEl.value = apiKey ?? "";
   systemPromptInputEl.value = settings.systemPrompt;
   safetySelectEl.value = settings.safetyThreshold;
+  const security = settings.security ?? DEFAULT_SECURITY_SETTINGS;
+  securityModeSelectEl.value = security.mode;
+  approvalCreateEl.checked = security.requireApprovalFor.create;
+  approvalEditEl.checked = security.requireApprovalFor.edit;
+  approvalDeleteEl.checked = security.requireApprovalFor.delete;
+  updateSecurityCheckboxesDisabled();
   settingsModalEl.classList.remove("hidden");
+  apiKeyDetectedNoteEl.classList.add("hidden");
+
+  // Only polls the clipboard while the settings modal (and thus the key field) is actually open.
+  startClipboardPolling(async (detectedKey) => {
+    apiKeyInputEl.value = detectedKey;
+    apiKeyDetectedNoteEl.classList.remove("hidden");
+    apiKey = detectedKey;
+    await saveApiKey(detectedKey);
+  });
 }
 
 function closeSettings() {
   settingsModalEl.classList.add("hidden");
+  stopClipboardPolling();
+}
+
+async function openGoogleAIStudioKeyPage() {
+  try {
+    await openUrl("https://aistudio.google.com/apikey");
+  } catch (err) {
+    alert(t.openLinkError(String(err)));
+  }
 }
 
 async function saveSettingsFromModal() {
@@ -527,20 +951,123 @@ async function saveSettingsFromModal() {
     await saveApiKey(newKey);
     apiKey = newKey || null;
   }
+  let mode = securityModeSelectEl.value as SecurityMode;
+  if (mode !== "always" && mode !== settings.security.mode) {
+    if (!(await ensureWorkspaceDisclaimerAccepted())) {
+      mode = settings.security.mode;
+      securityModeSelectEl.value = mode;
+    }
+  }
   settings = {
+    ...settings,
     systemPrompt: systemPromptInputEl.value,
     safetyThreshold: safetySelectEl.value,
+    security: {
+      mode,
+      requireApprovalFor: {
+        create: approvalCreateEl.checked,
+        edit: approvalEditEl.checked,
+        delete: approvalDeleteEl.checked,
+      },
+    },
   };
   await saveSettings(settings);
   closeSettings();
 }
 
+// ---- Language ----
+async function setAppLanguage(lang: Language) {
+  settings.language = lang;
+  setLanguage(lang);
+  langDeBtnEl.classList.toggle("active", lang === "de");
+  langEnBtnEl.classList.toggle("active", lang === "en");
+  applyStaticTranslations();
+  updateHeader();
+  renderWorkspaceBar();
+  renderChatList();
+  renderMessages();
+  await saveSettings(settings);
+}
+
+function applyStaticTranslations() {
+  document.getElementById("new-chat-label")!.textContent = t.newChat;
+  document.getElementById("settings-label")!.textContent = t.settings;
+  settingsBtnEl.title = t.settings;
+  attachBtnEl.title = t.attachFileTitle;
+  sendBtnEl.title = t.sendTitle;
+  promptInputEl.placeholder = t.promptPlaceholder;
+  document.getElementById("patchnotes-title")!.textContent = t.patchNotesTitle;
+  patchnotesCloseEl.title = t.patchNotesClose;
+  document.getElementById("editor-empty")!.textContent = t.openEditorEmpty;
+
+  document.getElementById("settings-title")!.textContent = t.settingsTitle;
+  document.getElementById("api-key-label")!.textContent = t.apiKeyLabel;
+  document.getElementById("api-key-hint")!.textContent = t.apiKeyHint;
+  getApiKeyBtnEl.textContent = t.getApiKeyBtn;
+  apiKeyDetectedNoteEl.textContent = t.apiKeyDetectedNote;
+  document.getElementById("system-prompt-label")!.textContent = t.systemPromptLabel;
+  document.getElementById("safety-label")!.textContent = t.safetyLabel;
+  settingsSaveEl.textContent = t.save;
+
+  const safetySelect = safetySelectEl;
+  if (safetySelect.options.length >= 4) {
+    safetySelect.options[0].textContent = t.safetyNone;
+    safetySelect.options[1].textContent = t.safetyHigh;
+    safetySelect.options[2].textContent = t.safetyMedium;
+    safetySelect.options[3].textContent = t.safetyLow;
+  }
+
+  document.getElementById("security-section-label")!.textContent = t.securitySectionLabel;
+  document.getElementById("security-mode-hint")!.textContent = t.securityModeHint;
+  if (securityModeSelectEl.options.length >= 3) {
+    securityModeSelectEl.options[0].textContent = t.securityModeAlways;
+    securityModeSelectEl.options[1].textContent = t.securityModePartial;
+    securityModeSelectEl.options[2].textContent = t.securityModeNone;
+  }
+  document.getElementById("approval-create-label")!.textContent = t.approvalCreateLabel;
+  document.getElementById("approval-edit-label")!.textContent = t.approvalEditLabel;
+  document.getElementById("approval-delete-label")!.textContent = t.approvalDeleteLabel;
+  document.getElementById("approval-delete-cancel")!.textContent = t.approvalCancel;
+  document.getElementById("approval-delete-confirm")!.textContent = t.approvalConfirmDelete;
+  document.getElementById("approval-diff-discard")!.textContent = t.approvalDiscard;
+  document.getElementById("approval-diff-accept")!.textContent = t.approvalAccept;
+}
+
+// ---- Patch notes ----
+function renderPatchNotes() {
+  const lang = getLanguage();
+  patchnotesBodyEl.innerHTML = PATCH_NOTES.map(
+    (entry) => `
+      <div class="patchnotes-entry">
+        <h3>v${entry.version}</h3>
+        <ul>${(lang === "en" ? entry.en : entry.de).map((n) => `<li>${escapeHtml(n)}</li>`).join("")}</ul>
+      </div>
+    `
+  ).join("");
+}
+
+function openPatchNotes() {
+  renderPatchNotes();
+  patchnotesModalEl.classList.remove("hidden");
+}
+
+function closePatchNotes() {
+  patchnotesModalEl.classList.add("hidden");
+}
+
 // ---- Init ----
 async function init() {
   populateModelSelect();
+  initEditor();
 
   settings = await loadSettings();
+  setLanguage(settings.language);
+  langDeBtnEl.classList.toggle("active", settings.language === "de");
+  langEnBtnEl.classList.toggle("active", settings.language === "en");
+  applyStaticTranslations();
+
   apiKey = await loadApiKey();
+  workspaceDisclaimerAccepted = await loadWorkspaceDisclaimerAccepted();
   chats = await loadChats();
   quota = await loadQuota();
   if (quota.date !== todayStr()) {
@@ -571,6 +1098,28 @@ async function init() {
       sendMessage();
     }
   });
+  promptInputEl.addEventListener("paste", (e: ClipboardEvent) => {
+    const items = e.clipboardData?.items;
+    if (!items) return;
+    for (const item of items) {
+      if (item.kind === "file" && item.type.startsWith("image/")) {
+        const file = item.getAsFile();
+        if (file) {
+          e.preventDefault();
+          addPendingImageFile(file);
+        }
+      }
+    }
+  });
+  promptInputEl.addEventListener("dragover", (e) => e.preventDefault());
+  promptInputEl.addEventListener("drop", (e) => {
+    const files = e.dataTransfer?.files;
+    if (!files || !files.length) return;
+    const hasImage = Array.from(files).some((f) => f.type.startsWith("image/"));
+    if (!hasImage) return;
+    e.preventDefault();
+    Array.from(files).forEach((f) => addPendingImageFile(f));
+  });
 
   modelSelectEl.addEventListener("change", () => {
     const chat = activeChat();
@@ -586,9 +1135,31 @@ async function init() {
   settingsModalEl.addEventListener("click", (e) => {
     if (e.target === settingsModalEl) closeSettings();
   });
+  getApiKeyBtnEl.addEventListener("click", openGoogleAIStudioKeyPage);
+  securityModeSelectEl.addEventListener("change", updateSecurityCheckboxesDisabled);
+
+  langDeBtnEl.addEventListener("click", () => setAppLanguage("de"));
+  langEnBtnEl.addEventListener("click", () => setAppLanguage("en"));
+
+  titlebarVersionEl.addEventListener("click", openPatchNotes);
+  patchnotesCloseEl.addEventListener("click", closePatchNotes);
+  patchnotesModalEl.addEventListener("click", (e) => {
+    if (e.target === patchnotesModalEl) closePatchNotes();
+  });
 
   checkForUpdates();
   initTitlebar();
+
+  try {
+    appVersion = await getAppVersion();
+    const lastSeenVersion = await loadLastSeenVersion();
+    if (lastSeenVersion !== appVersion) {
+      openPatchNotes();
+      await saveLastSeenVersion(appVersion);
+    }
+  } catch (err) {
+    console.debug("Versionsvergleich für Patch Notes fehlgeschlagen:", err);
+  }
 }
 
 init();
